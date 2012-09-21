@@ -9,8 +9,13 @@
   <review status="unreviewed" notes=""/>
   <url>http://ros.org/wiki/microstrain_mip_node</url>
   <depend package="roscpp"/>
-  <depend package="sensor_msgs"/>
+  <depend package="sensor_msgs"/> 
+  <depend package="self_test"/>
+  <depend package="tf"/>
+
   <depend package="geometry_msgs"/>
+  <depend package="diagnostic_updater"/>
+  <depend package="std_srvs"/>
 
 </package>
 

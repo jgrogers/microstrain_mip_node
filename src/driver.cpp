@@ -23,16 +23,16 @@ typedef unsigned char Byte;
 // Purge
 // Clears the com port's read and write buffers
 
-int Purge(ComPortHandle comPortHandle){
+bool Purge(ComPortHandle comPortHandle){
 
   if (tcflush(comPortHandle,TCIOFLUSH)==-1){
 
   ROS_INFO("flush failed\n");
-  return FALSE;
+  return false;
 
  }
 
- return TRUE;
+ return true;
 
 }
 
@@ -46,7 +46,7 @@ ComPortHandle OpenComPort(std::string& comPortPath){
   
   if (comPort== -1){ //Opening of port failed
     
-    ROS_INFO("Unable to open com Port %s\n Errno = %i\n", comPortPath, errno);
+    ROS_INFO("Unable to open com Port %s\n Errno = %i\n", comPortPath.c_str(), errno);
     return -1;
     
   }
@@ -129,16 +129,54 @@ int writeComPort(ComPortHandle comPort, unsigned char* bytesToWrite, int size){
 }
 
 // Simple Linux Console interface function
+struct MIP_Data_Response {
+  unsigned char desc_set;
+  unsigned char command_desc;
+  unsigned char command_echo;
+  unsigned char error_code;
+  double x,  y, z;
+  float position_acc;
+  unsigned short flags;
+  unsigned int time;
+  double ftime;
+};
 
-//attemots to read BUFFSIZE bytes at a time from the open port
-int readPort(ComPortHandle comPort){
-
- int i=0;
+bool checkAckResponse(const MIP_Data_Response& resp, unsigned char cmd) {
+  ROS_INFO("Resp error code %x, cmd echo %x, expecting %x",
+	 resp.error_code, resp.command_echo, cmd);
+  if (resp.error_code == 0x00 &&
+      resp.command_echo == cmd) return true;
+  else return false;
+  
+}
+void checkDataResponse(const MIP_Data_Response& resp) {
+  if (resp.desc_set == 0x80) {
+    if (resp.command_desc == 0x04) 
+      ROS_INFO("Got scaled acceleration (g) (%f, %f, %f)", 
+	       resp.x, resp.y, resp.z);
+    if (resp.command_desc == 0x05)
+      ROS_INFO("Got angular rate (rad/sec) (%f, %f, %f)", 
+	       resp.x, resp.y, resp.z);
+    if (resp.command_desc == 0x0e) 
+      ROS_INFO("Got time value %u ftime %f",
+	       resp.time, resp.ftime);
+  }
+  else if (resp.desc_set == 0x81) {
+    if (resp.command_desc == 0x04) 
+      ROS_INFO("Got ECEF position (%f %f %f) acc %f, vf: %u",
+	       resp.x, resp.y, resp.z, resp.position_acc, resp.flags);
+    if (resp.command_desc == 0x06) 
+      ROS_INFO("Got ECEF velocity (%f %f %f) acc %f, vf: %u",
+	       resp.x, resp.y, resp.z, resp.position_acc, resp.flags);
+  }
+	   
+}
+enum MIP_DATA_PARSE_T { FieldLength, CmdDesc, FieldData};
+//attempts to read one packet from the open port
+int readPort(ComPortHandle comPort, std::vector<MIP_Data_Response>& resp){
+  resp.clear();
  int size;
  struct termios initial_settings, new_settings;
- char command_string[255];
- char c;
- int ret;
  Byte response[BUFFSIZE] = {0};
 
  //get current terminal settings 
@@ -152,48 +190,164 @@ int readPort(ComPortHandle comPort){
  tcsetattr(0, TCSANOW, &new_settings);
 
  //determine if there are bytes to read
- size = readComPort(comPort, &response[0], BUFFSIZE);
-
- if(size<0)
-  return FALSE;
- 
- //if ther are bytes to read output them and check again
- while(size>0){
-
-  //write out any read bytes
-  for(i=0;i<size;i++){
-
-    ROS_INFO("%.2x ",response[i]|0x00);
-
-  }
-  c = getchar();
-
-  if(c != EOF)
-  {
-    tcsetattr(0, TCSANOW, &initial_settings);
-    ungetc(c,stdin);
-    gets(command_string);
-    remove_space(command_string);
-    ret=send_command(command_string,comPort);       
-    if(ret==-1)
-     return -1;
-    tcsetattr(0, TCSANOW, &new_settings);
-  }
-
-  size = readComPort(comPort, &response[0], BUFFSIZE);
-
+ size = 1;
+ while (response[0] != 0x75 && size) {
+   size = readComPort(comPort, &response[0], 1);//Read sync1
+ } 
+ //Synced
+ size = readComPort(comPort, &response[1], 3);; //Read the rest of the header
+ if (response[0] != 0x75 || 
+     response[1] != 0x65) {
+   ROS_ERROR("Error in sync");
+   return 0;
  }
-
+ unsigned char desc_set = response[2];
+ unsigned char payload_length = response[3];
+ size = readComPort(comPort, &response[4], payload_length+2);
+ if (size != payload_length+2) {
+   ROS_ERROR("Could not read enough");
+   return 0;
+ }
+ //Parse data fields
+ MIP_DATA_PARSE_T data_parse_t = FieldLength;
+ unsigned char field_length;
+ unsigned char cmd_desc;
+ for(unsigned int byte_ind = 0; byte_ind < payload_length;) {
+   switch(data_parse_t) {
+   case FieldLength:
+     field_length = response[4+byte_ind++];
+     data_parse_t = CmdDesc;
+     break;
+   case CmdDesc:
+     cmd_desc = response[4+byte_ind++];
+     data_parse_t = FieldData;
+     break;
+   case FieldData:
+     MIP_Data_Response rsp_one;
+     rsp_one.command_desc = cmd_desc;
+     rsp_one.desc_set = desc_set;
+     if (cmd_desc == 0xf1){ //Ack type
+       rsp_one.command_echo = response[4+byte_ind];
+       rsp_one.error_code = response[4+byte_ind+1];
+     }
+     else if (desc_set == 0x80) {
+       if (cmd_desc >= 0x01 && cmd_desc <= 0x08) {
+	 float x,y,z;
+	 unsigned char* xp = (unsigned char*) &x;
+	 unsigned char* yp = (unsigned char*) &y;
+	 unsigned char* zp = (unsigned char*) &z;
+	 for (int i = 0;i<4;i++) {
+	   xp[3-i] = response[4+byte_ind+i];
+	   yp[3-i] = response[4+byte_ind+i+4];
+	   zp[3-i] = response[4+byte_ind+i+8];
+	 }
+	 rsp_one.x = x;
+	 rsp_one.y = y;
+	 rsp_one.z = z;
+       }
+       else if (cmd_desc == 0x0e) {
+	 unsigned int time;
+	 unsigned char* tp = (unsigned char*) &time;
+	 for (int i = 0;i<4;i++) {
+	   tp[3-i] = response[4+byte_ind+i];
+	 }
+	 rsp_one.time = time;
+	 rsp_one.ftime = (double)time / (double)(62500);
+       }
+     }
+     else if (desc_set == 0x81) {
+       if (cmd_desc == 0x04) {
+	 double x,y,z;
+	 float acc; 
+	 unsigned short valid;
+	 unsigned char* xp = (unsigned char*) &x;
+	 unsigned char* yp = (unsigned char*) &y;
+	 unsigned char* zp = (unsigned char*) &z;
+	 unsigned char* accp = (unsigned char*) &acc;
+	 unsigned char* vp = (unsigned char*) &valid;
+	 for (int i = 0;i<8;i++) {
+	   xp[7-i] = response[4+byte_ind+i];
+	   yp[7-i] = response[4+byte_ind+i+8];
+	   zp[7-i] = response[4+byte_ind+i+16];
+	 }
+	 for (int i = 0;i<4;i++) {
+	   accp[3-i] = response[4+byte_ind+i+24];
+	 }
+	 for (int i = 0;i<2;i++) {
+	   vp[1-i] = response[4+byte_ind+i+28];
+	 }
+	 rsp_one.x = x;
+	 rsp_one.y = y;
+	 rsp_one.z = z;
+	 rsp_one.position_acc = acc;
+	 rsp_one.flags = valid;
+       }
+       if (cmd_desc == 0x06) {
+	 //ECEF velocity
+	 float x,y,z;
+	 float acc; 
+	 unsigned short valid;
+	 unsigned char* xp = (unsigned char*) &x;
+	 unsigned char* yp = (unsigned char*) &y;
+	 unsigned char* zp = (unsigned char*) &z;
+	 unsigned char* accp = (unsigned char*) &acc;
+	 unsigned char* vp = (unsigned char*) &valid;
+	 for (int i = 0;i<4;i++) {
+	   xp[3-i] = response[4+byte_ind+i];
+	   yp[3-i] = response[4+byte_ind+i+4];
+	   zp[3-i] = response[4+byte_ind+i+8];
+	 }
+	 for (int i = 0;i<4;i++) {
+	   accp[3-i] = response[4+byte_ind+i+12];
+	 }
+	 for (int i = 0;i<2;i++) {
+	   vp[1-i] = response[4+byte_ind+i+16];
+	 }
+	 rsp_one.x = x;
+	 rsp_one.y = y;
+	 rsp_one.z = z;
+	 rsp_one.position_acc = acc;
+	 rsp_one.flags = valid;
+       }
+     }
+     else if (desc_set == 0x0c) {
+       if (cmd_desc == 0x9b) {
+	 //Bias record, 3 floats
+	 float x,y,z;
+	 unsigned char* xp = (unsigned char*) &x;
+	 unsigned char* yp = (unsigned char*) &y;
+	 unsigned char* zp = (unsigned char*) &z;
+	 for (int i = 0;i<4;i++) {
+	   xp[3-i] = response[4+byte_ind+i];
+	   yp[3-i] = response[4+byte_ind+i+4];
+	   zp[3-i] = response[4+byte_ind+i+8];
+	 }
+	 rsp_one.x = x;
+	 rsp_one.y = y;
+	 rsp_one.z = z;
+       }
+     }
+     else {
+       ROS_ERROR("Unhandled message");
+       exit(0);
+     }
+     resp.push_back(rsp_one);
+     byte_ind += field_length - 2;
+     data_parse_t = FieldLength;
+     break;
+   }
+ }
+ 
  tcsetattr(0, TCSANOW, &initial_settings);
 
- return TRUE;
+ return 1;
 
 }
 
 //scandev
 //finds attached microstrain devices and prompts user for choice then returns 
 //selected portname
-char* scandev(){
+std::string scandev(){
  
  FILE *instream;
  char devnames[255][255];//allows for up to 256 devices with path links up to 
@@ -205,7 +359,7 @@ char* scandev(){
  char *device;
 
  //search /dev/serial for microstrain devices
- char *command = "find /dev/serial -print | grep -i microstrain";
+ const char *command = "find /dev/serial -print | grep -i microstrain";
  
  ROS_INFO("Searching for devices...\n");
 
@@ -213,7 +367,7 @@ char* scandev(){
 
  if(!instream){//SOMETHING WRONG WITH THE SYSTEM COMMAND PIPE...EXITING
   ROS_INFO("ERROR BROKEN PIPELINE %s\n", command);
-  return device;
+  return std::string("");
  }
 
  //load char array of device addresses
@@ -250,25 +404,22 @@ char* scandev(){
     }
   }
   device=devnames[userchoice];
-  return device;
+  return std::string(device);
 
  }
  else{
   ROS_INFO("No MicroStrain devices found.\n");
-  return device; 
+  return std::string(device);
  }
 
 }
 
-int send_command(char command_string[], ComPortHandle comPort){
+bool send_command(const char command_string[], ComPortHandle comPort){
 
  int number_hex_chars;
  int string_length;
  unsigned char* hexs;
  int i;
- 
- if(strcmp(command_string,"exit")==0)
-  return EXIT;
  
  //deterine length of command string
  string_length = strlen(command_string);
@@ -277,7 +428,7 @@ int send_command(char command_string[], ComPortHandle comPort){
  //so the length of the string should always be even
  if(string_length%2!=0){
   ROS_INFO("Invalid Command\n");
-  return FALSE;
+  return false;
  }
 
  //each hex char is only 1 byte from the two entered
@@ -289,10 +440,10 @@ int send_command(char command_string[], ComPortHandle comPort){
  //process each 2-char set from an ascii representation of the hexadecimal
  //command byte to the associated byte
  for(i=0;i<number_hex_chars;i++){
-  if(sscanf(&command_string[i*2],"%2x",&hexs[i])<1){
-   ROS_INFO("Invalid Command\n");
-   return FALSE;
-  }
+   if(sscanf(&command_string[i*2],"%2x",&hexs[i])<1){
+     ROS_INFO("Invalid Command\n");
+     return false;
+   }
  }
  //write command 
  writeComPort(comPort, hexs, number_hex_chars); 
@@ -300,7 +451,7 @@ int send_command(char command_string[], ComPortHandle comPort){
  //deallocate the memory for the hex bytes
  free(hexs); 
 
- return TRUE;
+ return true;
 }
 
 // main
@@ -308,60 +459,96 @@ int main(int argc, char* argv[]){
   ros::init(argc, argv, "microstrain_mip_node");
   ros::NodeHandle nh;
   ComPortHandle comPort;
-  int ret;
+  int ret = 0;
   std::string port;
   nh.param("port", port, std::string("/dev/ttyACM0"));
   ROS_INFO("Attempting to open port...%s\n",port.c_str());
   comPort = OpenComPort(port);
-
+  if (comPort == -1) {
+    ROS_ERROR("Cannot attach to IMU at port %s, trying automatic initialization",
+	      port.c_str());
   }
   else{
-
-   ROS_INFO("Failed to find attached device.\n");
-   return FALSE;
-
+    std::string dev=scandev();  
+    if(strcmp(dev.c_str(),"")!=0){
+      
+      printf("Attempting to open port...%s\n",dev.c_str());
+      comPort = OpenComPort(dev);
+    }
   }
-
- }
- else{//Open port specified at commandline
-
-  ROS_INFO("Attempting to open port...%s\n",argv[1]);
-  comPort = OpenComPort(argv[1]);
-
- }
-
- ROS_INFO("comPort=%i\n",comPort);
-
  if(comPort > 0){ 
+   
+   ROS_INFO("Connected to IMU.");
 
-  ROS_INFO("Connected. \n\nEnter Command as specified in 3DM-GX3 MIP DCP");
-  ROS_INFO(" followed by an <ENTER> Then utility will attempt to read");
-  ROS_INFO("reply on port.\n The resulting read will read all characters ");
-  ROS_INFO(" available currently then return for user command.\n");
-  
-  while(1){//continue until user chooses to exit
+   std::vector<MIP_Data_Response> mip_responses;
 
-   ROS_INFO("\nEnter Command (\"exit\" to exit)> "); 
-   //get command from user
-   gets(command_string);    
-   remove_space(command_string);
-   ret=send_command(command_string,comPort);
-   //exit if user specified this
-   if(ret==EXIT)
-    break;
-   //read port if user didn't ask for exit
-   ret=readPort(comPort);
-   //exit if user specified this
-   if(ret==EXIT)
-    break;
+   
+   //Disable streaming
+   ret = send_command("75650C0A0511010100051101020021C3", comPort);
+   ret = readPort(comPort, mip_responses);
+   if (mip_responses.size() != 2 || 
+       !checkAckResponse(mip_responses[0], 0x11) ||
+       !checkAckResponse(mip_responses[1], 0x11)) {
+     ROS_ERROR("Failed to disable streaming");
+     exit(0);
+   }
+   //Select scaled acceleration, angular rate, and timestamp AHRS msgs
+   ret = send_command("75650C0D0D08010304000A05000A0E000A4195", comPort);
+   ret = readPort(comPort, mip_responses);
+   if (mip_responses.size() != 1 ||
+       !checkAckResponse(mip_responses[0], 0x08)) {
+     ROS_ERROR("Failed to select AHRS message format");
+     exit(0);
+   }
+   //Select GPS component messages
+   ret = send_command("75650C0A0A090102040004060004188E", comPort);
+   ret = readPort(comPort, mip_responses);
+   if (mip_responses.size()!= 1 ||
+       !checkAckResponse(mip_responses[0], 0x09)) {
+     ROS_ERROR("Failed to select GPS data format");
+     exit(0);
+   }
+   //Enable streaming
+   ret = send_command("75650C0A0511010101051101020123CA", comPort);
+   ret = readPort(comPort, mip_responses);
+   if (mip_responses.size()!= 2 ||
+       !checkAckResponse(mip_responses[0], 0x011),
+       !checkAckResponse(mip_responses[1], 0x011)) {
+     ROS_ERROR("Failed to enable streaming");
+     exit(0);
+   }
 
-  }
+   while (ros::ok() ){
+     /*     ret = send_command("75650C0404010000EFDA", comPort);
+	    ret = readPort(comPort, mip_responses);
+	    if (mip_responses.size() != 1 ||
+	    !checkAckResponse(mip_responses[0], 0x01)) {
+	    ROS_ERROR("Failed to ack polling command properly");
+	    exit(0);
+	    }*/
+     ret = readPort(comPort, mip_responses);
+     for (size_t i = 0;i<mip_responses.size();i++) {
+       checkDataResponse(mip_responses[i]);
+     }
+     
+   }
+   ret = send_command("75650C0A0511010100051101020021C3", comPort);
+   ret = readPort(comPort, mip_responses);
+   if (mip_responses.size() != 2 || 
+       !checkAckResponse(mip_responses[0], 0x11) ||
+       !checkAckResponse(mip_responses[1], 0x11)) {
+     ROS_ERROR("Failed to disable streaming");
+     exit(0);
+   }else {
+     ROS_INFO("Streaming mode disabled");
+   }
+   
+   ROS_INFO("EXITING\n"); 
 
-  ROS_INFO("EXITING\n"); 
-  CloseComPort(comPort);
+   CloseComPort(comPort);
 
  }
 
- return 0;
+ return ret;
 
 }

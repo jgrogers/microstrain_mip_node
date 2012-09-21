@@ -56,6 +56,7 @@ or: (FOR SERIAL)
 
 typedef int ComPortHandle;
 typedef unsigned char Byte;
+int send_command(char command_string[], ComPortHandle comPort);
 
 //function to remove whitespace from commands
 void remove_space(char *string_with_spaces){
