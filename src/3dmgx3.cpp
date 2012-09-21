@@ -82,6 +82,24 @@ static float extract_float(uint8_t* addr) {
 }
 
 
+void compute_checksum(char* mip_packet, size_t len, 
+		      char& checksum_byte1, char& checksum_byte2) {
+  checksum_byte1 = 0;
+  checksum_byte2 = 0;
+  for(unsigned int i=0; i<len; i++)
+    {
+      checksum_byte1 += mip_packet[i];
+      checksum_byte2 += checksum_byte1;
+    }
+
+  //  checksum = ((u16) checksum_byte1 << 8) + (u16) checksum_byte2;
+}
+
+void append_checksum(char* mip_packet, size_t len) {
+  //Assuming that 2 extra bytes are allocated...
+  compute_checksum(mip_packet, len, mip_packet[len], mip_packet[len+1]);
+}
+
 //! Helper function to get system time in nanoseconds.
 static unsigned long long time_helper()
 {
@@ -251,7 +269,14 @@ microstrain_3dmgx3_imu::IMU::setContinuous()
 {
 
   //Select scaled acceleration, angular rate, and timestamp AHRS msgs
-  send_command("75650C0D0D08010304000A05000A0E000A4195");
+  //send_command("75650C0D0D08010304000A05000A0E000A4195");
+  char cmd_string[22] = {0x75, 0x65, 0x0C, 0x10, 0x10,
+		      0x08, 0x01, 0x04, 0x04, 0x00,
+		      0x0A, 0x05, 0x00, 0x0A, 0x0E,
+		      0x00, 0x0A, 0x09, 0x00, 0x0A,
+		      0xBE, 0xEF}; //Beef gets replaced by true checksum
+  append_checksum(cmd_string, sizeof(cmd_string)-2);
+  write(fd, cmd_string, sizeof(cmd_string));
   std::vector<MIP_Data_Response> mip_responses;
   readPort(mip_responses);
   if (mip_responses.size() != 1 ||
@@ -558,7 +583,7 @@ readPort(std::vector<MIP_Data_Response>& resp){
 	 //Orientation
 	 for (unsigned int j = 0;j<9;j++) {
 	   unsigned char* rp = (unsigned char*) &rsp_one.orientation[j];
-	   for (unsigned int k = 0;k<9;k++) {
+	   for (unsigned int k = 0;k<4;k++) {
 	     rp[3-k] = response[4+byte_ind+k+j*4];
 	   }
 	 }
